@@ -1,11 +1,17 @@
 # DECISIONS.md
 
-1. **Indexes.** `employees`: unique `emp_code` (identity, enforces no duplicates), `(department, emp_code)` (filtered, sorted list; department lookups), `joined_on` (summary headcount). `attendance_logs`: unique `(emp_code, date)` (one record per day; monthly, trend, PATCH), `(date desc, emp_code)` (list sort, leaderboard month range), `(status, date desc, emp_code)` (status filter and its count), `(emp_code, punch_in desc)` (punch-out's latest record). Rejected: a lone `status` index, because it is low-cardinality and does not help the sort.
+1. **Indexes.** On `attendance_logs`:
+   * unique `(emp_code, date)` guarantees one record per day and serves the monthly summary, the trend and PATCH;
+   * `(date desc, emp_code)` matches the list's sort order and the leaderboard's month range;
+   * `(status, date desc, emp_code)` serves a status filter and its `total` count;
+   * `(emp_code, punch_in desc)` finds the record a punch-out closes.
 
-2. **Punch-in race.** Both requests compute the same `(emp_code, date)` and call `insert_one`. There is no read beforehand. MongoDB's unique index admits exactly one. The other gets `DuplicateKeyError`, which I return as 409.
+   On `employees`: unique `emp_code`, `(department, emp_code)`, and `joined_on` for headcount. I rejected a plain `status` index: with only five values it barely narrows the search and cannot provide the sort.
 
-3. **Ties.** `$setWindowFields` with `$rank` gives competition ranks (1, 2, 2, 4). I filter `rank <= limit` afterwards, so everyone tied at the cutoff is returned, ordered by `emp_code`. The response can exceed `limit`, as the contract requires.
+2. **Punch-in race.** Both requests compute the same `(emp_code, date)` and go straight to `insert_one`; there is no "does it exist?" check first. The unique index lets exactly one insert succeed. The other raises `DuplicateKeyError`, which I return as 409.
 
-4. **Headcount.** The pipeline starts from `employees` (`joined_on <= month end`), `$lookup`s logs, and unwinds with `preserveNullAndEmptyArrays`. Each employee keeps one row with index 0 or null, and I count those rows.
+3. **Ties.** `$rank` gives tied employees the same rank and skips the next (1, 2, 2, 4). I keep `rank <= limit` *after* ranking, so everyone tied at the cutoff is returned, sorted by `emp_code`, even if that exceeds `limit`.
 
-5. **At 100x.** Precompute daily per-department rollups when a record is written, so trend and summary read about 30 small documents instead of scanning raw logs.
+4. **Headcount.** The pipeline starts from `employees` (joined by month end) and joins their logs. Employees with no logs keep a single empty row, so each person is counted exactly once.
+
+5. **At 100x.** Maintain daily per-department totals on every write, so the summary and trend read a few rows instead of scanning raw logs.
